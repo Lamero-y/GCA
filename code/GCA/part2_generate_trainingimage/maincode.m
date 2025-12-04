@@ -1,0 +1,931 @@
+clc;
+clear;
+%目的：确定→类别占比确定→module R的实现(1.随机抽取basic unit 2.根据relationship，稀疏度，以及选取的basic unit生成training image)
+%% config
+imagepath='F:\lly\small_ablation\image_part\train\';
+labelpath='F:\lly\small_ablation\label_part\train\';
+labmicrDir=dir([labelpath '*.png']);
+imageDir=dir([imagepath '*.png']);
+labelDir=dir([labelpath '*.png']);
+data_infor_path='F:\lly\small_ablation\data_information\';
+% data_infor_path='D:\ljy\generate_image\data_information\';
+save_similar_infor='F:\lly\small_ablation\data_information\similar_infor\';
+save_micro_path='F:\lly\small_ablation\gca\label\';
+save_image_path='F:\lly\small_ablation\gca\image\';
+s = 512;
+% 上一步已经生成的“初始训练数据”（含 withoeasy_classinfor）
+save_image_path_in  = 'F:\lly\gid5\augmis_theta0.8\image\';
+save_micro_path_in  = 'F:\lly\gid5\augmis_theta0.8\label\';   
+% withoeasy_classinfor 为空的样本，直接拷贝到最终训练集
+savepathimage = 'F:\lly\gid5\augmis_theta0.8\endimage\';
+savepathlabel = 'F:\lly\gid5\augmis_theta0.8\endlabel\';
+mkdir(save_micro_path)
+mkdir(save_image_path)
+mkdir(savepathimage); mkdir(savepathlabel);
+mkdir(save_image_path); mkdir(save_micro_path);
+training_set_number=3000;%训练数据总数
+gray_value=1:5; %数据集对应的类别灰度值
+s=512;  % 训练数据的大小512*512
+irr_class=[1];
+road_class=[]; % the value of road
+car_class=[]; % the information of car
+clutter=[]; %background
+
+%% 信息加载
+load([data_infor_path 'Rawimage_pixelsnum.mat'])
+load([data_infor_path 'basicunit_infor.mat'])
+load([data_infor_path 'upbasicunit_infor.mat'])
+load([data_infor_path 'Relationship.mat'])
+load([data_infor_path 'Prior_matrix.mat'])
+load([data_infor_path 'minbox_diffclass.mat'])
+load([data_infor_path 'Curclass_infor.mat'])
+Classcol_infor=Curclass_infor;
+empty_positions = find(cellfun(@(x) isempty(x), {Classcol_infor.classcol}));
+Classcol_infor(empty_positions)=[];
+%将上述给定信息存储到结构体中
+Given_infor.imagepath=imagepath;
+Given_infor.labelpath=labelpath;
+Given_infor.training_set_number=training_set_number;
+Given_infor.gray_value=gray_value;
+%Given_infor.training_set_perclass_num=training_set_perclass_num;
+Given_infor.basicunit_infor=basicunit_infor;
+Given_infor.upbasicunit_infor=upbasicunit_infor;
+Given_infor.Rawimage_pixelsnum=Rawimage_pixelsnum;
+% Prior_matrix=mask2former_prior;
+Given_infor.Prior_matrix=Prior_matrix;
+Given_infor.s = s;
+Given_infor.minbox_diffclass=minbox_diffclass;
+Given_infor.adjcant_relationship=Relationship.adjcant_relationship;
+
+%% 计算包含类别
+allclass_containre=sum(Relationship.contain_relationship,2);
+allclass_objectnum=cell2mat(cellfun(@(x) length(x),{basicunit_infor.alloriginal_id},...
+    'UniformOutput', false));
+contain_toclass=gray_value(allclass_containre./allclass_objectnum'>0.5);
+
+%% 基于抽样理论强化类别误分对的数据生成
+Prior_matrix=roundn(Prior_matrix,-3);%保留3位小数
+Prior_matrix_all=Prior_matrix+Prior_matrix';
+Prior_easy=triu(Prior_matrix_all)-diag(diag(Prior_matrix_all));
+emisclassification_thres=roundn(sum(Prior_easy(:))/(sum(Prior_easy(:)~=0)),-2);
+Prior_easy_thres=Prior_easy.*(Prior_easy>emisclassification_thres);
+[em_stats_x,em_stats_y]=find(Prior_easy_thres~=0);
+% 计算X取值为1至length(gray_value)所有可能的概率值
+%（1）根据系统抽样得到的类别所有可能估计总体类别可能
+classall_pro=[Classcol_infor.classcol_totalnum]./sum([Classcol_infor.classcol_totalnum]);
+classall_pro_idx=find(classall_pro<0.0001);
+classall_pro(classall_pro_idx)=0.0001;
+%（2）获取所有出现类别集合对应的增强权重
+classcol_allpossible={Classcol_infor.classcol};
+all_misclassified_pairs = [em_stats_x em_stats_y];%类别y误分为类别x
+all_misclassified_pairspro=Prior_easy_thres(Prior_easy_thres~=0);
+all_misclassified_pairspro=all_misclassified_pairspro./sum(all_misclassified_pairspro);
+augweight=zeros(length(Classcol_infor),1);
+empair_num=zeros(length(Classcol_infor),1);
+empair_allexits=cell(length(Classcol_infor),1);
+empair_topro=cell(length(Classcol_infor),1);
+for k_p=1:length(Classcol_infor)
+    classcol_cur=Classcol_infor(k_p).classcol;
+    empair_in_classcol_logits = sum(ismember(all_misclassified_pairs,classcol_cur),2)==2;
+    if sum(empair_in_classcol_logits)==0
+        augweight(k_p)=1;
+        empair_num(k_p)=0;
+        empair_topro{k_p}=0;
+    else
+        empair_in_classcol_topro=empair_in_classcol_logits.*all_misclassified_pairspro;
+        empair_in_classcol_topro(empair_in_classcol_topro==0)=[];
+        augweight(k_p)=sum(exp(empair_in_classcol_topro)');
+        empair_num(k_p)=sum(empair_in_classcol_logits);
+        empair_allexits{k_p}=all_misclassified_pairs(empair_in_classcol_logits,:);
+        empair_topro{k_p}=exp(empair_in_classcol_topro)./sum(exp(empair_in_classcol_topro));
+    end
+end
+classall_pro_weight=classall_pro.*augweight'./sum(classall_pro.*augweight');
+
+%% 生成总数为training_set_number的训练数据集合
+%% step1:生成含有易误分类别对的训练数据，并记录未含有易误分类别对的类别信息
+%initialization
+choose_basic_index=cell(length(gray_value),1);%记录抽取的basic unit信息
+choose_basicidx=cell(length(gray_value),1);%记录抽取的basic unit对应raw image的idx信息
+record_class_infor=cell(training_set_number,1);
+gray_pixelsnum=zeros(1,length(gray_value));%记录生成影像的各个类别像素个数之和
+record_oneclass=zeros(length(gray_value),1);%记录生成影像的类别只含有一类对应的个数
+record_curclasscol=cell(training_set_number,1);%记录生成影像的类别集合
+record_curclass_pro_normal=cell(training_set_number,1);%记录生成影像的类别所占比例集合
+record_curclass_areanum=cell(training_set_number,1);%记录生成影像的各个类别区域数集合
+record_lastclass=cell(training_set_number,1);
+record_curclass_id=[];
+withoeasy_classinfor=cell(training_set_number,1);
+easyclass_infor=cell(training_set_number,1);
+choose_thres_trainingdata = zeros(training_set_number,1); % 记录每次的抽取的混淆对的thres信息
+% 代码中断后，加载以下信息继续运行
+% load([save_image_path 'choose_basic_index.mat'])
+% load([save_image_path 'record_class_infor.mat'])
+% load([save_image_path 'choose_basicidx.mat'])
+% load([save_image_path 'gray_pixelsnum.mat'])
+% load([save_image_path 'record_curclasscol.mat'])
+% load([save_image_path 'record_oneclass.mat'])
+% load([save_image_path 'record_curclass_pro_normal.mat'])
+% load([save_image_path 'record_curclass_areanum.mat'])
+% load([save_image_path 'record_curclass_id.mat'])
+% load([save_image_path 'withoeasy_classinfor.mat'])
+% load([save_image_path 'easyclass_infor.mat'])
+% load([save_image_path 'record_lastclass.mat'])
+
+for k=1:training_set_number
+    %1.1 根据类别权重抽取当前类别集合
+    seed = 2025+k;                % 固定一个种子值，可根据实验轮次调整
+    rng(seed, 'twister');       % 使用 Mersenne Twister 伪随机生成器
+
+    % ==== 按权重抽样 ====
+    seedrand=rand();%0.2193 0.8016 0.0846
+    choose_iniclass = find(seedrand <= cumsum(classall_pro_weight), 1, 'first');
+    % 误分对判断，并获取误分对信息：
+    if empair_num(choose_iniclass)~=0 %存在误分对
+        empair_topro_cur=cell2mat(empair_topro(choose_iniclass));
+        seed = 1000+k;                % 固定一个种子值，可根据实验轮次调整
+        rng(seed, 'twister');
+        seedrand1=rand();%判断是否强调误分类别对0.3062 0.1290 0.5978
+        if seedrand1>0.5
+            seed = 5+k;                % 固定一个种子值，可根据实验轮次调整
+            rng(seed, 'twister');
+            seedrand2=rand();
+            chooseempairs_id = find(seedrand2 <= cumsum(empair_topro_cur), 1, 'first');
+            exits_empairs=empair_allexits{choose_iniclass};
+            chooseempairs=exits_empairs(chooseempairs_id,:);
+            choose_class=chooseempairs(2);
+            em_toclass=chooseempairs(1);%the class of  choose_class is misclassified as the class of  em_toclass.
+            easyclass_infor{k}=chooseempairs;
+        else
+            choose_classcol=Classcol_infor(choose_iniclass).classcol;
+            withoeasy_classinfor{k}=choose_classcol;
+            choose_class=[];
+            em_toclass=[];
+            chooseempairs=[];
+            simi_easymisinfor=[];
+            if isempty(choose_class)
+                continue;
+            end
+        end
+        %choose_class_idx = find(sum(simi_easymisinfor>0.8,2)>1);%可选区的basic unit的索引信息
+    else
+        %不存在误分对，则从随机中随机选取一张子影像作为训练数据
+        choose_classcol=Classcol_infor(choose_iniclass).classcol;
+        withoeasy_classinfor{k}=choose_classcol;
+        choose_class=[];
+        em_toclass=[];
+        chooseempairs=[];
+        continue;
+    end
+    % 根据包含关系重拍类别信息顺序
+    choose_classcol_initial = Classcol_infor(choose_iniclass).classcol;
+    Curclasscol_infor = updatasort_accordingconrelationship(choose_classcol_initial,chooseempairs,Relationship,basicunit_infor);
+    choose_classcol = Curclasscol_infor.classcol;
+    em_toclass = Curclasscol_infor.em_toclass;
+    choose_class = Curclasscol_infor.choose_class;
+    
+    
+    currentclass_his  = upbasicunit_infor(choose_class).allcurclass_countshistogram;
+    otherclass_his    = upbasicunit_infor(em_toclass).allcurclass_countshistogram;
+
+    currentclass_his_nor = currentclass_his ./ sum(currentclass_his,2);
+    otherclass_his_nor   = otherclass_his   ./ sum(otherclass_his,2);
+
+    n = size(currentclass_his_nor,1);
+    m = size(otherclass_his_nor,1);
+
+    block = 400;    % 分块大小，可调
+    simi_easymisinfor = zeros(n, m, 'single');   % FULL 矩阵，但 float32，大幅减内存
+
+    % ---------------------------
+    % ? 分块矩阵乘法构造 similarity（完全保持原逻辑）
+    % ---------------------------
+    for i = 1:block:n
+        i2 = min(i + block - 1, n);
+        partA = currentclass_his_nor(i:i2, :);
+
+        S = partA * otherclass_his_nor';     % block × m
+        simi_easymisinfor(i:i2, :) = sqrt(S);
+    end
+
+    % ---------------------------
+    % ? 幂次矩阵修正（完全保留你的不放回逻辑）
+    % ---------------------------
+    if isempty([choose_basic_index{choose_class}])
+        cnt_l = zeros([n, 1]);
+    else
+        cnt_l = accumarray([choose_basic_index{choose_class}]', 1, [n,1]);
+    end
+
+    if isempty([choose_basic_index{em_toclass}])
+        cnt_lp = zeros([m, 1]);
+    else
+        cnt_lp = accumarray([choose_basic_index{em_toclass}]', 1, [m,1]);
+    end
+
+    P_apper_unitnum = cnt_l * cnt_lp.' + 1;     % n × m
+    simi_easymisinfor = simi_easymisinfor .^ P_apper_unitnum;
+    
+%     currentclass_his=upbasicunit_infor(choose_class).allcurclass_countshistogram;
+%     currentclass_his_nor=currentclass_his./sum(currentclass_his,2);
+%     otherclass_his=upbasicunit_infor(em_toclass).allcurclass_countshistogram;
+%     otherclass_his_nor=otherclass_his./sum(otherclass_his,2);
+%     similarity_matrix = sqrt(currentclass_his_nor * otherclass_his_nor');
+%     
+%     %strr1=strcat('similarity_matrix_',num2str(choose_class),'_',num2str(em_toclass),'.mat');
+%     %load([save_similar_infor strr1]);
+%     simi_easymisinfor=similarity_matrix;
+%     %对simi_easymisinfor进行更新，尽可能使得每个unit是不放回抽样
+%     n_simi = size(similarity_matrix,1);
+%     m_simi = size(similarity_matrix,2);
+%     if isempty([choose_basic_index{choose_class}])
+%         cnt_l = zeros([n_simi, 1]);
+%     else
+%         cnt_l = accumarray([choose_basic_index{choose_class}]',  1, [n_simi,1]);   % n×1
+%     end
+%     if isempty([choose_basic_index{em_toclass}])
+%         cnt_lp = zeros([m_simi, 1]);
+%     else
+%         cnt_lp = accumarray([choose_basic_index{em_toclass}]', 1, [m_simi, 1]);   % m×1
+%     end
+%     % 幂次矩阵（乘积模式：更强调“两边都常抽到”的位置）
+%     P_apper_unitnum = cnt_l * cnt_lp.'+1;    % n×m
+%     simi_easymisinfor = simi_easymisinfor .^ P_apper_unitnum; % 幂乘修正
+    
+    choose_classcolareanum=Classcol_infor(choose_iniclass).classnum_todistribution;
+    choose_classcolpro=Classcol_infor(choose_iniclass).classpro_todistribution;
+    % 1.2 根据抽取类别集合对应的类别数分布确定当前区域数以及对应的类别占比
+    choose_classcol_areanum=zeros(length(choose_classcol),1);
+    choose_classcol_pro=zeros(length(choose_classcol),1);
+    for kk=1:length(choose_classcol)
+        %1.2.1 根据分布生成当前类别对应的类别数
+        curclass_toareanum=choose_classcolareanum(kk,:);
+        if isnan(curclass_toareanum)
+            choose_classcol_areanum(kk)=1;
+            choose_classcol_pro(kk)=0.1;
+        else
+            curclass_toareanum_logits= curclass_toareanum~=0;
+            curclass_toareanum_validindex = find(curclass_toareanum_logits == 1,1, 'last');
+            curclass_toareanum_valid = curclass_toareanum(1:curclass_toareanum_validindex);
+            seed = 58+k;                % 固定一个种子值，可根据实验轮次调整
+            rng(seed, 'twister');
+            seedrand2=rand();
+            choose_classnum = find(seedrand2 <= cumsum(curclass_toareanum_valid), 1, 'first');        
+            %1.2.2 根据分布生成当前类别对应的占比
+            curclass_numtopro=choose_classcolpro{kk};
+            curclass_topro=curclass_numtopro(choose_classnum,:);
+            curclass_topro_logits= curclass_topro~=0;
+            curclass_topro_validindex = find(curclass_topro_logits == 1,1, 'last');
+            curclass_topro_valid = curclass_topro(1:curclass_topro_validindex);
+            seed = 69+k;                % 固定一个种子值，可根据实验轮次调整
+            rng(seed, 'twister');
+            seedrand3=rand();
+            choose_proidx = find(seedrand3 <= cumsum(curclass_topro_valid), 1, 'first');
+            choose_pro=choose_proidx*0.1;
+            choose_classcol_areanum(kk)=choose_classnum;
+            choose_classcol_pro(kk)=choose_pro;
+        end
+    end
+    % update area number
+    curclass_pro_normal=choose_classcol_pro./sum(choose_classcol_pro);
+    %更换类别顺序，保证被误分为其他类的类别在最后获取basic unit集合
+    [~, new_indices] = ismember(choose_classcol, choose_classcol_initial);
+
+    % 根据新顺序重新排列区域数和占比数组
+    curclass_pro_normalchange = curclass_pro_normal(new_indices);
+    choose_classcol_areanumchange= choose_classcol_areanum(new_indices);
+    classcol_infor=update_area_number(Relationship,choose_classcol,curclass_pro_normalchange,choose_classcol_areanumchange,irr_class);  
+    lastclass=classcol_infor.lastclass;
+    curclass_pro_normal = classcol_infor.curclass_pro_normal;
+    choose_classcol_areanum = classcol_infor.choose_classcol_areanum;
+    record_lastclass{k}=lastclass;
+    record_curclasscol{k}=choose_classcol;
+    record_curclass_pro_normal{k}=curclass_pro_normal;
+    record_curclass_areanum{k}=choose_classcol_areanum;
+    
+    % 1.4：获取当前类别之间的关系矩阵
+    classcol_adjacent=Relationship.adjcant_relationship(choose_classcol,choose_classcol); %当前类别集合的相邻关系信息矩阵
+    classcol_contain=Relationship.contain_relationship(choose_classcol,choose_classcol); %当前类别集合的包含关系信息矩阵
+    classcol_containwith=Relationship.containwith_relationship(choose_classcol,choose_classcol);
+    classcol_georelationship=classcol_adjacent+classcol_contain+classcol_containwith;
+    % 1.5：pick basic unit 
+    choosepick_classcol=[intersect(choose_classcol,contain_toclass) choose_classcol(~ismember(choose_classcol,contain_toclass))];
+    curclasswithotherclass_allgeorelation=zeros(3,length(choose_classcol));%第一行表示相邻关系，第二行表示包含关系
+    Curbasic_unit=[]; choosebasic_index=[]; chooseclass_his=[];  Withcontain_classinfor_all=[];
+    for k1=1:length(choosepick_classcol)
+        curfill_class=choosepick_classcol(k1);%获取当前的类别值
+        curclass_area=curclass_pro_normal(k1)*(s^2);
+        curfill_areanum=choose_classcol_areanum(k1);
+        %判断当前值curfill_class与其他类的位置信息                
+        otherclass_indexcol = ~ismember(choosepick_classcol,curfill_class);%0表示包含
+        curclasswithotherclass_allgeorelation(1,:) =classcol_adjacent(k1,:)./sum(classcol_georelationship(k1,:));%获取当前类与该类的位置概率
+        curclasswithotherclass_allgeorelation(2,:) =classcol_contain(k1,:)./sum(classcol_georelationship(k1,:));%获取当前类与该类的位置概率
+        curclasswithotherclass_allgeorelation(3,:) = classcol_containwith(k1,:)./sum(classcol_georelationship(k1,:));
+        curclass_withotherclass_georelation = curclasswithotherclass_allgeorelation(:,otherclass_indexcol==1);
+        % 当前待抽取类别信息整合
+        curclass_infor.curfill_class=curfill_class;
+        curclass_infor.curclass_area=curclass_area;
+        curclass_infor.curfill_areanum=curfill_areanum;
+        curclass_infor.choose_classcol=choosepick_classcol;
+        curclass_infor.choose_class=choose_class;
+        curclass_infor.em_toclass=em_toclass;
+        curclass_infor.simi_easymisinfor=simi_easymisinfor;
+        curclass_infor.curclasswithotherclass_allgeorelation=curclasswithotherclass_allgeorelation;
+        
+        if ismember(curfill_class,irr_class) && ~ismember(curfill_class,em_toclass)%若为不规则类别，则从影像数据中选择区域数值，且大小与其相近的进行直接填充   
+            % 选取合适的basic unit时area以及误分信息选取
+            curclassbasic_allarea = basicunit_infor(curfill_class).allcurclass_area; %获取满足当前类别的basic unit的area集合
+            curclass_alloriginalid = basicunit_infor(curfill_class).alloriginal_id;
+            curclass_allBoundingBox = basicunit_infor(curfill_class).allcurclass_BoundingBox;
+            curclass_allcentroid = basicunit_infor(curfill_class).allcurclass_centroid;
+            if choose_class == curfill_class
+                thres=0.8;
+                % 尽可能抽取到更多可能的混淆相似对
+                statsimi_classindex_ori = find(sum(simi_easymisinfor>=thres,2)>1);
+                % 情况2：相似度的最大值小于0.5
+                while isempty(statsimi_classindex_ori) 
+                    thres=thres-0.05;
+                    statsimi_classindex_ori = find(sum(simi_easymisinfor>=thres,2)>1);
+                    delete_chooseindex_simi = ismember(statsimi_classindex_ori, [choose_basic_index{curfill_class}]); 
+                    statsimi_classindex_ori(delete_chooseindex_simi) = []; 
+                end                    
+                %2. 分层获取当前类别的basic unit信息
+                statsnees_classidx = curclass_alloriginalid(statsimi_classindex_ori);
+                choose_id_already=[choose_basicidx{curfill_class}];
+                if length(choose_id_already)==length(unique(curclass_alloriginalid))
+                    choose_basicidx{curfill_class}=[];
+                end
+                statsimi_classindex_condi1=statsimi_classindex_ori(~ismember(statsnees_classidx,[choose_basicidx{curfill_class}]));    
+                statsimi_class_toarea = curclassbasic_allarea(statsimi_classindex_condi1);
+                %筛选满足的basic unit（即basic unit的area信息大于curclass_area）
+                statsneed_classindex = statsimi_classindex_condi1(statsimi_class_toarea>=curclass_area);
+                if isempty(statsneed_classindex)
+                    statsneed_classindex=statsimi_classindex_condi1;
+                end
+                if isempty(statsneed_classindex)
+                    statsneed_classindex=statsimi_classindex_ori;
+                end
+            else
+                statsneed_classindex_ori=1:length(curclassbasic_allarea);
+                delete_chooseindex=ismember(statsneed_classindex_ori, [choose_basic_index{curfill_class}]); 
+                statsneed_classindex_ori(delete_chooseindex)=[];  %获取当前索引集合，不放回抽样
+                %2. 分层获取当前类别的basic unit信息
+                statsnees_classidx = curclass_alloriginalid(statsneed_classindex_ori);
+                choose_id_already=unique([choose_basicidx{curfill_class}]);
+                if length(choose_id_already)==length(unique(curclass_alloriginalid))
+                    choose_basicidx{curfill_class}=[];
+                end
+                statsneed_classindex=statsneed_classindex_ori(~ismember(statsnees_classidx,[choose_basicidx{curfill_class}]));
+    
+                %当basic unit全被抽取，则二次重新抽取
+                if isempty(statsneed_classindex)
+                    statsneed_classindex=statsneed_classindex_ori;
+                end
+                if isempty(statsneed_classindex)
+                    choose_basic_index{curfill_class}=[];
+                    statsneed_classindex=1:length(curclassbasic_allarea);
+                end
+            end
+            statsneed_classtoarea=curclassbasic_allarea(statsneed_classindex);
+            [~,nearest_idx]=min(abs(statsneed_classtoarea-curclass_area));
+            curselected_id=statsneed_classindex(nearest_idx);
+            % 获取抽取点坐标信息
+            sampledpoints_id=curclass_alloriginalid(curselected_id);%将所有满足该类索引的basic unit展开后的索引信息 
+            if curselected_id>length(curclassbasic_allarea)
+                keyboard
+            end
+            choose_basic_index{curfill_class}=[choose_basic_index{curfill_class} curselected_id];
+            %获取当前选取的basic unit信息
+            statscurclass_boundingbox=curclass_allBoundingBox(curselected_id,:);%[列 行 宽 高]
+            statscurclass_centroid=curclass_allcentroid(curselected_id,:);
+            % 获取待抽取的basic unit信息
+            [basic_image,basic_label,sampledp]=randcrop_image(Given_infor,sampledpoints_id,statscurclass_boundingbox,curfill_class,curclass_area);
+            [curbasic_row,curbasic_col,~]=size(basic_image);
+            % 获取该数据中包含类别对应的各种信息(例如道路上的各类信息)
+            % Withcontain_classinfor涵盖该类中包含哪些类别信息，以及大小信息
+            Curbasic_unitidx=size(Curbasic_unit,1)+1;
+            [Withcontain_classinfor,basic_label_update,curbasic_boxb]=acquire_conclassinfor(basic_label,curfill_class,contain_toclass,car_class,clutter);
+            if ~isempty(Withcontain_classinfor)
+                Withcontain_classinfor = arrayfun(@(x, y) setfield(x, 'containclassidx', y),...
+                                         Withcontain_classinfor, repmat(Curbasic_unitidx,[size(Withcontain_classinfor,1) 1]));
+            end
+            curselected_id_choose_class=curselected_id;
+            Withcontain_classinfor_all=[Withcontain_classinfor_all;Withcontain_classinfor];
+            Cursameclass=cell(1,10);
+            Cursameclass{1,1}=basic_label_update;
+            Cursameclass{1,2}=basic_image;
+            Cursameclass{1,3}=curfill_class;
+            Cursameclass{1,4}=(sum(basic_label_update(:)~=0))/(curbasic_row*curbasic_col);
+            Cursameclass{1,5}=curbasic_row*curbasic_col;
+            Cursameclass{1,6}=choosepick_classcol(curclasswithotherclass_allgeorelation(1,:)~=0); %存储该类与其它类所有的相邻位置关系
+            Cursameclass{1,7}=curclasswithotherclass_allgeorelation(:,curclasswithotherclass_allgeorelation(1,:)~=0); %存储该类与其它类所有的相邻位置关系的概率集合
+            Cursameclass{1,8}=statscurclass_centroid;
+            if choose_class == curfill_class
+                choosebasic_index=[choosebasic_index;curselected_id];
+                Cursameclass{1,9}=1;
+            else
+                Cursameclass{1,9}=0;
+            end 
+            Cursameclass{1,10}=0;
+            Cursameclass{1,11}=curbasic_boxb;%带填充的boxboundings
+            Curbasic_unit=[Curbasic_unit;Cursameclass];
+        elseif ismember(curfill_class,irr_class) && ismember(em_toclass,curfill_class)
+            curclassbasic_allarea = basicunit_infor(curfill_class).allcurclass_area; %获取满足当前类别的basic unit的area集合
+            curclass_alloriginalid = basicunit_infor(curfill_class).alloriginal_id;
+            curclass_allBoundingBox = basicunit_infor(curfill_class).allcurclass_BoundingBox;
+            curclass_allcentroid = basicunit_infor(curfill_class).allcurclass_centroid;
+            thres=0.8;
+            simi_basicindex_ori=find(simi_easymisinfor(curselected_id_choose_class,:)>=thres);
+            while isempty(simi_basicindex_ori)
+                thres=thres-0.05;
+                simi_basicindex_ori = find(simi_easymisinfor(curselected_id_choose_class,:)>=thres);
+            end
+            %2.分层获取当前类别的basic unit信息
+            statsnees_classidx = curclass_alloriginalid(simi_basicindex_ori);
+            choose_id_already=[choose_basicidx{curfill_class}];
+            if length(choose_id_already)==length(imageDir)
+                choose_basicidx{curfill_class}=[];
+            end
+            simi_basicindex = simi_basicindex_ori(~ismember(statsnees_classidx,[choose_basicidx{curfill_class}]));
+            if isempty(simi_basicindex)
+                simi_basicindex=simi_basicindex_ori;
+            end
+
+            simi_toarea=curclassbasic_allarea(simi_basicindex);
+            simi_toarea_statsindex=simi_basicindex(simi_toarea>=curclass_area);
+            if isempty(simi_toarea_statsindex)
+                [~,nearest_idx]=min(abs(simi_toarea-curclass_area));
+                simi_toarea_statsindex=simi_basicindex(nearest_idx);
+            end
+            
+            rng(169 + k, 'twister');   % 每个 k 不同，但每次运行一致
+            closest_rindex = simi_toarea_statsindex(randperm(length(simi_toarea_statsindex),1));
+            sampledpoints_id = curclass_alloriginalid(closest_rindex);
+            choose_thres_trainingdata(k)=simi_easymisinfor(curselected_id_choose_class,closest_rindex);
+            selected_boxb = curclass_allBoundingBox(closest_rindex,:);
+            statscurclass_centroid = curclass_allcentroid(closest_rindex,:);
+            if  closest_rindex>length(curclassbasic_allarea)
+                keyboard
+            end
+            
+            choose_basic_index{curfill_class}=[choose_basic_index{curfill_class} closest_rindex];
+            % 获取待抽取的basic unit信息
+            [basic_image,basic_label,sampledp] = randcrop_image(Given_infor,sampledpoints_id,selected_boxb,curfill_class,curclass_area);
+            [curbasic_row,curbasic_col,~]=size(basic_image);
+            % 获取该数据中包含类别对应的各种信息(例如道路上的各类信息)
+            % Withcontain_classinfor涵盖该类中包含哪些类别信息，以及大小信息
+            % 当前包含类别在Curbasic_unit上的索引值
+            Curbasic_unitidx=size(Curbasic_unit,1)+1;
+            [Withcontain_classinfor,basic_label_update,curbasic_boxb]=acquire_conclassinfor(basic_label,curfill_class,contain_toclass,car_class,clutter);
+            if ~isempty(Withcontain_classinfor)
+                Withcontain_classinfor = arrayfun(@(x, y) setfield(x, 'containclassidx', y),...
+                                         Withcontain_classinfor, repmat(Curbasic_unitidx,[size(Withcontain_classinfor,1) 1]));
+            end
+            Withcontain_classinfor_all=[Withcontain_classinfor_all;Withcontain_classinfor];
+            % 计算抽取basic unit对应的分布
+            Cursameclass=cell(1,9);
+            Cursameclass{1,1}=basic_label_update;
+            Cursameclass{1,2}=basic_image;
+            Cursameclass{1,3}=curfill_class;
+            Cursameclass{1,4}=(sum(basic_label(:)~=0))/(curbasic_row*curbasic_col);
+            Cursameclass{1,5}=curbasic_row*curbasic_col;
+            Cursameclass{1,6}=choosepick_classcol(curclasswithotherclass_allgeorelation(1,:)~=0); %存储该类与其它类所有的相邻位置关系
+            Cursameclass{1,7}=curclasswithotherclass_allgeorelation(:,curclasswithotherclass_allgeorelation(1,:)~=0); %存储该类与其它类所有的相邻位置关系的概率集合
+            Cursameclass{1,8}=statscurclass_centroid;
+            Cursameclass{1,9}=1;
+            Cursameclass{1,10}=0; %包围该类basic unit的索引值
+            Cursameclass{1,11}=curbasic_boxb;%带填充的boxboundings
+            Curbasic_unit=[Curbasic_unit;Cursameclass];
+        else
+            tic
+            [Cursameclass,Curclass_areavalue,choose_basic_index,choose_basicindex,choose_basicidx,choose_thres_trainingdata_part]=pick_basic_unit(Given_infor,...
+                curclass_infor,choose_basic_index,choosebasic_index,choose_basicidx,Withcontain_classinfor_all,k);
+            choosebasic_index=[choosebasic_index;choose_basicindex];
+            if ~isempty(choose_thres_trainingdata_part)
+                choose_thres_trainingdata(k)=choose_thres_trainingdata_part;
+            end
+            if choose_class==curfill_class && isempty(choosebasic_index)
+               em_toclass=[];
+            end
+            elapsed_time2=toc;
+            Curbasic_unit=[Curbasic_unit;Cursameclass];
+            disp(['获取basic unit：', num2str(elapsed_time2)])
+        end
+    end
+    
+    if isempty(em_toclass)
+        choose_classcol=Classcol_infor(choose_iniclass).classcol;
+        withoeasy_classinfor{k}=choose_classcol;
+        choose_class=[];
+        em_toclass=[];
+        chooseempairs=[];
+        continue;
+    end
+
+    %1.6 combinating basic units into training image
+    % 1.6.1 包围关系的填充
+    Curbasic_unitupdate=containorwithfill(Curbasic_unit,k);
+    % 1.6.2 根据稀疏度以及大小进行basic unit的填充
+    if length(lastclass)~=1
+        lastclass=lastclass(randperm(length(lastclass),1));
+    end
+    basicunit_fillsort=sort_basicunit(Curbasic_unitupdate,lastclass,s);
+    % 1.6.3 填充
+    label_micro=zeros(s,s);
+    image_micro=zeros(s,s,3);
+    basic_cen=cell(length(basicunit_fillsort),2);
+    for k2=1:length(basicunit_fillsort)
+        willfill_basicid=basicunit_fillsort(k2);
+        fill_factor=Curbasic_unit{willfill_basicid,8};
+        willfill_image=Curbasic_unit{willfill_basicid,2}; % 填充的basic unit image
+        willfill_label=Curbasic_unit{willfill_basicid,1}; % 填充的basic unit label
+        if isempty(willfill_image)
+            continue;
+        end
+        [curbasic_row,curbasic_col]=size(willfill_label);
+        willfill_class=Curbasic_unit{willfill_basicid,3};%填充basic unit的类别
+        willfill_adclass=Curbasic_unit{willfill_basicid,6};%填充的basicunit的邻接类别
+        if sum(label_micro(:))==0%第一种情况：label_micro完全未填充
+            row_inipoints=1;
+            col_inipoints=1;
+            rng(268 + k, 'twister');
+            angle_rand=rand();
+            rng(165 + k, 'twister');
+            angle_value=randi(360,1);
+            if angle_rand>0.5
+                willfill_image=imrotate(willfill_image,angle_value); % 填充的basic unit image
+                willfill_label=imrotate(willfill_label,angle_value);
+                [curbasic_row,curbasic_col]=size(willfill_label);
+                if curbasic_row>s || curbasic_col>s
+                    willfill_image=Curbasic_unit{willfill_basicid,2}; % 填充的basic unit image
+                    willfill_label=Curbasic_unit{willfill_basicid,1}; % 填充的basic unit label
+                    [curbasic_row,curbasic_col]=size(willfill_label);
+                end
+            end
+            %将该区域填充到影像中
+            willfill_image_new=willfill_image.*uint8(repmat(willfill_label~=0,[1, 1, 3]));
+            label_micro(row_inipoints:row_inipoints+curbasic_row-1,col_inipoints:col_inipoints+curbasic_col-1)=willfill_label;
+            image_micro(row_inipoints:row_inipoints+curbasic_row-1,col_inipoints:col_inipoints+curbasic_col-1,:)=willfill_image_new;
+            basic_cen{1,1}=willfill_class;
+            basic_cen{1,2}=Curbasic_unit{willfill_basicid,8};
+        else
+            label_micro_middle=zeros(s,s);image_micro_middle=zeros(s,s,3);
+            [fill_pixelpoints,theta]=compare_choosepoints(label_micro,Curbasic_unit, willfill_basicid,minbox_diffclass,basic_cen,k);
+            basic_cen{1}=willfill_class;
+            basic_cen{2}=Curbasic_unit{willfill_basicid,8}+fill_pixelpoints-1;
+            willfill_image=imrotate(willfill_image,theta);
+            willfill_label=imrotate(willfill_label,theta);
+            willfill_image(all(willfill_label==0,2),:,:)=[];
+            willfill_image(:,all(willfill_label==0,1),:)=[];
+            
+            willfill_label(all(willfill_label==0,2),:)=[];
+            willfill_label(:,all(willfill_label==0,1))=[];
+            
+            [curbasic_row,curbasic_col]=size(willfill_label);
+            willfill_image_new=willfill_image.*uint8(repmat(willfill_label~=0,[1, 1, 3]));
+%             % 去除细缝
+%             mask_label_grid=mask_grid(label_micro,32);
+%             mask_label=matrixexpand(mask_label_grid,32);
+%             mask_label_micro=mask_label~=0 |  label_micro~=0;
+            
+            image_micro_middle(fill_pixelpoints(1):fill_pixelpoints(1)+curbasic_row-1,fill_pixelpoints(2):fill_pixelpoints(2)+curbasic_col-1,:)=willfill_image_new;
+            label_micro_middle(fill_pixelpoints(1):fill_pixelpoints(1)+curbasic_row-1,fill_pixelpoints(2):fill_pixelpoints(2)+curbasic_col-1)=willfill_label;
+            imagemicro_1=image_micro(:,:,1);imagemicro_2=image_micro(:,:,2);imagemicro_3=image_micro(:,:,3);
+            choose_image1=image_micro_middle(:,:,1);  choose_image2=image_micro_middle(:,:,2);choose_image3=image_micro_middle(:,:,3);             
+            imagemicro_1(label_micro==0)=choose_image1(label_micro==0);
+            imagemicro_2(label_micro==0)=choose_image2(label_micro==0);
+            imagemicro_3(label_micro==0)=choose_image3(label_micro==0);
+            image_micro(:,:,1)=imagemicro_1;image_micro(:,:,2)=imagemicro_2;image_micro(:,:,3)=imagemicro_3;
+            label_micro(label_micro==0)=label_micro_middle(label_micro==0);
+        end
+    end
+    last_fillcalss=lastclass;
+
+    flag2=1;flag3=1;
+    noreapeat_idx=[];
+    %% 二次填充：
+    %获取当前类别的basic unit的信息：
+    willbasic_windows=[s,s];
+    [basic_image,basic_label,fill_rotate,choose_basic_index]=fill_lastclass_maxone(label_micro,imagepath,labelpath,...
+    upbasicunit_infor,choose_basic_index,last_fillcalss,noreapeat_idx,k);
+    label_micro=imrotate(label_micro,fill_rotate);
+    image_micro=imrotate(image_micro,fill_rotate);
+    [curbasicrow,curbasiccol]=size(basic_label);
+    willfillimage_new=basic_image.*uint8(repmat(basic_label~=0,[1, 1, 3]));
+    image_micro_middle(1:1+curbasicrow-1,1:1+curbasiccol-1,:)=willfillimage_new;
+    label_micro_middle(1:1+curbasicrow-1,1:1+curbasiccol-1)=basic_label;
+    imagemicro_1=image_micro(:,:,1);imagemicro_2=image_micro(:,:,2);imagemicro_3=image_micro(:,:,3);
+    choose_image1=image_micro_middle(:,:,1);  choose_image2=image_micro_middle(:,:,2);choose_image3=image_micro_middle(:,:,3);             
+    imagemicro_1(label_micro==0)=choose_image1(label_micro==0);
+    imagemicro_2(label_micro==0)=choose_image2(label_micro==0);
+    imagemicro_3(label_micro==0)=choose_image3(label_micro==0);
+    image_micro(:,:,1)=imagemicro_1;image_micro(:,:,2)=imagemicro_2;image_micro(:,:,3)=imagemicro_3;
+    label_micro(label_micro==0)=label_micro_middle(label_micro==0);
+    % 若填充后仍小于0.4，则进行填充       
+    while sum(label_micro(:)==0)>s*s*0.4
+        %获取当前缺失矩阵信息
+        % 寻找一张最大的符合当前区域的basic unit进行填充 
+        pro=0.008;
+        label_binary=label_micro==0;
+        State=regionprops(label_binary);
+        toosmall_dilateindex=find([State.Area]<s*s*pro);
+        State(toosmall_dilateindex)=[];
+        %根据State抽取basic unit进行填充
+        for k7=1:length(State)
+            absent_size=ceil(State(k7).BoundingBox);%当前缺失大小信息
+            %获取当前类别的basic unit的信息：
+            curclassbasic_allarea = upbasicunit_infor(last_fillcalss).allcurclass_area; %获取满足当前类别的basic unit的area集合
+            curclass_originalid = upbasicunit_infor(last_fillcalss).alloriginal_id;
+            curclass_BoundingBox = upbasicunit_infor(last_fillcalss).allcurclass_BoundingBox;
+            statsneed_classindex=1:length(curclassbasic_allarea); %不放回抽样
+            delete_chooseindex=unique([choose_basic_index{last_fillcalss}]);           
+            if length(delete_chooseindex)==length(statsneed_classindex)%标志着当前类别所有的basic unit均已抽取过，则将重新二次抽取
+%                 keyboard;
+                choose_basic_index{last_fillcalss}=[];
+                delete_chooseindex=unique([choose_basic_index{last_fillcalss}]);
+            end
+            statsneed_classindex(delete_chooseindex)=[];%剔除抽取过的basic unit的索引信息 
+            Allsubregion_indices= find((curclass_BoundingBox(statsneed_classindex,3)>= absent_size(3) & curclass_BoundingBox(statsneed_classindex,4)>= absent_size(4))==1);%获取statsneed_classindex中满足条件的所有索引值
+            if isempty(Allsubregion_indices)
+                Allsubregion_indices= find((curclass_BoundingBox(:,3)>= absent_size(3) & curclass_BoundingBox(:,4)>= absent_size(4))==1);
+                Allsubregion_indices_nprempat=setdiff(Allsubregion_indices,noreapeat_idx);
+                thres=1;
+                while isempty(Allsubregion_indices_nprempat)
+                    thres=thres-0.01;
+                    Allsubregion_indices= find((curclass_BoundingBox(:,3)>= absent_size(3)*thres & curclass_BoundingBox(:,4)>= absent_size(4)*thres)==1);
+                    Allsubregion_indices_nprempat=setdiff(Allsubregion_indices,noreapeat_idx);
+                end
+                selectarea_allinfor=curclassbasic_allarea(Allsubregion_indices_nprempat);
+                Allsubregion_indices=Allsubregion_indices_nprempat(find(selectarea_allinfor>absent_size(3)*absent_size(4)*0.7));
+            end
+            rng(1025 + k, 'twister');
+            chooseimage_index=Allsubregion_indices(randperm(length(Allsubregion_indices),1));
+            noreapeat_idx=[noreapeat_idx,chooseimage_index];
+            choose_basic_index{last_fillcalss}=[choose_basic_index{last_fillcalss} chooseimage_index];%记录所有抽取过的basic unit索引信息
+            original_id=curclass_originalid(chooseimage_index);
+            basic_image=imread([imagepath labelDir(original_id).name]);
+            raw_label=imread([labelpath labelDir(original_id).name]);
+            %获取对应的basic unit信息(512*512大小)
+            basic_boundingbox=curclass_BoundingBox(chooseimage_index,:)-[0 0 1 1];
+            basic_image=imcrop(basic_image,basic_boundingbox);%imcrop表示[列坐标 行坐标 列值 行值]；
+            basic_label=imcrop(raw_label,basic_boundingbox);
+            %将不等于当前值的类别全部注释为0
+            basic_label(basic_label~=last_fillcalss)=0;
+            [curbasic_row,curbasic_col]=size(basic_label);
+            if curbasic_row>s || curbasic_col>s
+                crop_row=min(curbasic_row,s);
+                crop_col=min(curbasic_col,s);
+                [fill_cpixelpoints]=pick_suitarea(basic_label,[crop_row crop_col],k);
+                basic_label_c=imcrop(basic_label,[fill_cpixelpoints(2) fill_cpixelpoints(1)...
+                               crop_col-1 crop_row-1]);
+                basic_image_c=imcrop(basic_image,[fill_cpixelpoints(2) fill_cpixelpoints(1)...
+                               crop_col-1 crop_row-1]);
+                basic_image=basic_image_c;
+                basic_label=basic_label_c;
+                [curbasic_row,curbasic_col]=size(basic_label);
+            end  
+            basiclabel_classpnly3=repmat(uint8(basic_label~=0), [1, 1, 3]);
+            basic_image=basic_image.*basiclabel_classpnly3;
+            [fill_pixelpoints]=pick_submatrix_max(label_micro,basic_label,k);
+            image_micro_middle=zeros(s,s,3);label_micro_middle=zeros(s,s);
+            image_micro_middle(fill_pixelpoints(1):fill_pixelpoints(1)+curbasic_row-1,fill_pixelpoints(2):fill_pixelpoints(2)+curbasic_col-1,:)=basic_image;
+            label_micro_middle(fill_pixelpoints(1):fill_pixelpoints(1)+curbasic_row-1,fill_pixelpoints(2):fill_pixelpoints(2)+curbasic_col-1)=basic_label;
+            imagemicro_1=image_micro(:,:,1);imagemicro_2=image_micro(:,:,2);imagemicro_3=image_micro(:,:,3);
+            choose_image1=image_micro_middle(:,:,1);  choose_image2=image_micro_middle(:,:,2);choose_image3=image_micro_middle(:,:,3);             
+            imagemicro_1(label_micro==0)=choose_image1(label_micro==0);
+            imagemicro_2(label_micro==0)=choose_image2(label_micro==0);
+            imagemicro_3(label_micro==0)=choose_image3(label_micro==0);
+            image_micro(:,:,1)=imagemicro_1;image_micro(:,:,2)=imagemicro_2;image_micro(:,:,3)=imagemicro_3;
+            label_micro(label_micro==0)=label_micro_middle(label_micro==0); 
+            flag3=flag3+1;
+         end
+    end
+    %记录每次生成的影像各个类别的像素个数
+    image_curclass=setdiff(unique(label_micro),0);
+    for kgray=1:length(image_curclass)
+        curclassinfor=image_curclass(kgray);
+        gray_pixelsnum(curclassinfor)=gray_pixelsnum(curclassinfor)+sum(label_micro(:)==curclassinfor);
+    end   
+    strr=strcat('image_',num2str(k),'.png');
+    save([save_image_path 'record_oneclass.mat'],'record_oneclass')
+    save([save_image_path 'record_curclasscol.mat'],'record_curclasscol')
+    imwrite(uint8(image_micro),([save_image_path strr]))
+    imwrite(uint8(label_micro),([save_micro_path strr]))
+    save([save_image_path 'choose_basic_index.mat'],'choose_basic_index')
+    save([save_image_path 'record_class_infor.mat'],'record_class_infor')
+    save([save_image_path 'gray_pixelsnum.mat'],'gray_pixelsnum')
+    save([save_image_path 'record_curclasscol.mat'],'record_curclasscol')
+    save([save_image_path 'record_oneclass.mat'],'record_oneclass')
+    save([save_image_path 'record_curclass_pro_normal.mat'],'record_curclass_pro_normal')
+    save([save_image_path 'record_curclass_id.mat'],'record_curclass_id')
+    save([save_image_path 'record_curclass_areanum.mat'],'record_curclass_areanum')
+    save([save_image_path 'withoeasy_classinfor.mat'],'withoeasy_classinfor')
+    save([save_image_path 'easyclass_infor.mat'],'easyclass_infor')
+    save([save_image_path 'record_lastclass.mat'],'record_lastclass')
+    save([save_image_path 'choose_basicidx.mat'],'choose_basicidx')
+    save([save_image_path 'choose_thres_trainingdata.mat'],'choose_thres_trainingdata')
+end
+
+
+%% step2-----------------------------
+% 0. 先拷贝 withoeasy_classinfor 为空的样本
+%% -----------------------------
+image_idx = find(cellfun(@isempty, withoeasy_classinfor)); 
+
+parfor kkk = 1:length(image_idx)
+    k_choose = image_idx(kkk);
+    strr1 = sprintf('image_%d.png', k_choose);
+    img   = imread(fullfile(save_image_path_in,  strr1));
+    lab   = imread(fullfile(save_micro_path_in,  strr1));
+    imwrite(img, fullfile(savepathimage, strr1));
+    imwrite(lab, fullfile(savepathlabel, strr1));
+end
+
+%% -----------------------------
+% 1. 裁剪 120 张大图为 s*s patch，统计类别组合
+%% -----------------------------
+imagedir = dir(fullfile(labelpath, '*.png'));
+
+% croppedData: 1×M struct, 字段:
+%   index   -> 属于第几张原始大图（imagedir 下标）
+%   classes -> patch 的类别集合（如 [1 2 3]，也可能为 []）
+%   position-> n×4 的 [x y w h]
+croppedData = cropimage_bystep(labelpath, [s s]);
+
+all_classes = {croppedData.classes};
+tuple_str   = cellfun(@mat2str, all_classes,'UniformOutput',false);
+
+[allclassinfor_arrays, ~, idx_all] = unique(tuple_str);
+
+% position_info{combID} = 所有该组合对应的 croppedData 索引
+position_info = arrayfun(@(u)find(idx_all==u), 1:length(allclassinfor_arrays), ...
+                         'UniformOutput', false);
+
+%% -----------------------------
+% 2. 当前训练数据中的类别组合（withoeasy）
+%% -----------------------------
+td_str = cellfun(@mat2str, withoeasy_classinfor,'UniformOutput',false);
+[allclassinfor_td, ~, td_idx] = unique(td_str);
+
+Samplenumbers_td = zeros(1, length(allclassinfor_td)-1);
+willnum = 0;
+
+for k = 1:length(allclassinfor_td)-1
+    need_now = sum(td_idx==k) + willnum;
+
+    idx_c = position_info{strcmp(allclassinfor_arrays, allclassinfor_td{k})};
+    avail_counts = cellfun(@(x) size(x,1), {croppedData(idx_c).position});
+
+    if sum(avail_counts) < need_now
+        Samplenumbers_td(k) = sum(avail_counts);
+        willnum = need_now - sum(avail_counts);
+    else
+        Samplenumbers_td(k) = need_now;
+        willnum = 0;
+    end
+end
+
+%% -----------------------------
+% 3. 构造 remainComb_full（对每种组合的需求）
+%% -----------------------------
+numGlobalComb = length(allclassinfor_arrays);
+remainComb_full = zeros(1, numGlobalComb);  % 对所有组合的需求，默认 0
+
+for k = 1:length(allclassinfor_td)-1
+    combStr_td = allclassinfor_td{k};
+    gid = find(strcmp(allclassinfor_arrays, combStr_td),1);
+    if ~isempty(gid)
+        remainComb_full(gid) = Samplenumbers_td(k);
+    end
+end
+
+totalNeeded = sum(remainComb_full);
+
+%% -----------------------------
+% 4. 构建 ImagePatchList（每张大图对应若干 patch）
+%% -----------------------------
+numImages = length(imagedir);
+ImagePatchList = cell(numImages,1);
+for i = 1:numImages
+    ImagePatchList{i}.patches = {};
+end
+
+for k = 1:length(croppedData)
+    imgID = croppedData(k).index;
+
+    % 过滤无类别 / 无位置的条目
+    if isempty(croppedData(k).classes) || isempty(croppedData(k).position)
+        continue;
+    end
+
+    combStr = mat2str(croppedData(k).classes);
+    combID  = find(strcmp(allclassinfor_arrays, combStr),1);
+    if isempty(combID)
+        continue;
+    end
+
+    posList = croppedData(k).position;  % n×4
+
+    for t = 1:size(posList,1)
+        ImagePatchList{imgID}.patches{end+1} = struct( ...
+            'comb', combID, ...
+            'bbox', posList(t,:) );
+    end
+end
+
+patchCountPerImage = cellfun(@(x) length(x.patches), ImagePatchList);
+
+%% -----------------------------
+% 5. 计算每张大图的目标抽取数量（尽量均衡）
+%% -----------------------------
+targetMean  = totalNeeded / numImages;   % 理论上每张约 totalNeeded/numImages
+
+targetPerImage = repmat(floor(targetMean), numImages,1);
+remain = totalNeeded - sum(targetPerImage);
+
+if remain > 0
+    extraIdx = randperm(numImages, remain);
+    targetPerImage(extraIdx) = targetPerImage(extraIdx) + 1;
+end
+
+% 限制不超过每张图实际可抽的 patch 总数
+targetPerImage = min(targetPerImage, patchCountPerImage');
+
+%% -----------------------------
+% 6. 按组合需求【加权】 + 每图均衡限制，开始抽取 patch
+%    —— 组合需求作为“权重”，idx 均衡作为“硬约束”
+%% -----------------------------
+remainingComb = remainComb_full;   % 长度 = 全部组合数
+currentCount  = zeros(numImages,1);
+
+fprintf('=== 全局均衡抽样开始 ===\n');
+
+for imgID = 1:numImages
+
+    needFromImg = targetPerImage(imgID);
+    if needFromImg <= 0
+        continue;
+    end
+
+    patches = ImagePatchList{imgID}.patches;
+    patches = patches(~cellfun(@isempty, patches));  % 防御性过滤
+    if isempty(patches)
+        continue;
+    end
+
+    combIDs = cellfun(@(x) x.comb, patches);
+    numP   = numel(combIDs);
+
+    % 这一张图最多能取的 patch 数（理论上 = needFromImg，因为前面已经 min 过）
+    pickN = min(needFromImg, numP);
+    if pickN <= 0
+        continue;
+    end
+
+    % -------- 关键改动：用 remainingComb 作为权重来抽样 --------
+    weights = remainingComb(combIDs);
+    weights(weights < 0) = 0;
+
+    if all(weights == 0)
+        % 如果所有组合都已经没有“剩余需求”，则退化为均匀抽样
+        weights = ones(size(weights));
+    end
+
+    % 为了避免 0 权重，保证数值稳定
+    weights = weights(:);
+    weights(weights <= 0) = eps;
+
+    % 使用 Efraimidis–Spirakis 算法做“按权重不放回抽样”
+    u   = rand(numP,1);
+    key = u .^ (1 ./ weights);   % 权重大 → key 更大 → 更容易被选中
+
+    [~, order] = sort(key, 'descend');
+    selected = order(1:pickN);
+
+    % -------- 从该原图中裁剪并保存 patch --------
+    imgName = imagedir(imgID).name;
+    bigImg  = imread(fullfile(imagepath, imgName));
+    bigLab  = imread(fullfile(labelpath, imgName));
+
+    for si = 1:length(selected)
+        sidx = selected(si);
+        box  = patches{sidx}.bbox;
+
+        pImg = imcrop(bigImg, box);
+        pLab = imcrop(bigLab, box);
+
+        outName = sprintf('img%d_patch_%d.png', imgID, sidx);
+        imwrite(uint8(pImg), fullfile(save_image_path, outName));
+        imwrite(uint8(pLab), fullfile(save_micro_path, outName));
+
+        % 将该组合的全局需求减 1（不限制不能为负，后面统一 max(.,0)）
+        remainingComb(combIDs(sidx)) = remainingComb(combIDs(sidx)) - 1;
+    end
+
+    currentCount(imgID) = pickN;
+end
+
+fprintf('=== 全局均衡抽样完成 ===\n');
+disp('每张原图最终抽取数量：');
+disp(currentCount');
+fprintf('总共抽取 patch 数量 = %d（目标总数 = %d）\n', sum(currentCount), sum(targetPerImage));
